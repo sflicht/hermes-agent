@@ -1,10 +1,13 @@
 """Regression tests for delegate_task isolation from parent Kanban workers."""
 from __future__ import annotations
 
+import argparse
+import contextvars
 import json
 import os
 import shlex
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -301,3 +304,145 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert task.status == "running"
     assert run.status == "running"
     assert workspace.is_dir()
+
+
+def test_parent_context_survives_overlapping_async_child_mutation_attempts(
+    monkeypatch,
+    tmp_path,
+):
+    """An async child cannot taint the overlapping parent or mutate its task."""
+    kb, tid, _workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch,
+        tmp_path,
+    )
+    from agent.delegation_context import is_delegated_child_process_context
+    from hermes_cli import kanban
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools
+    from tools.delegate_tool_child_run import _ChildRun
+    from tools.environments.local import LocalEnvironment
+
+    def complete_args(result: str) -> argparse.Namespace:
+        return argparse.Namespace(
+            kanban_action="complete",
+            task_ids=[tid],
+            result=result,
+            summary=None,
+            metadata=None,
+            board=None,
+        )
+
+    def parent_supported_complete() -> int:
+        return kanban.kanban_command(complete_args("parent completion"))
+
+    def parent_task_status() -> str:
+        conn = kbc.connect()
+        try:
+            task = kb.get_task(conn, tid)
+            assert task is not None
+            return task.status
+        finally:
+            conn.close()
+
+    child_active = threading.Event()
+    allow_child_checks = threading.Event()
+    child_checks_done = threading.Event()
+    allow_child_finish = threading.Event()
+
+    class Parent:
+        pass
+
+    class Child:
+        session_id = "async-child-session"
+
+        def run_conversation(self, **_kwargs):
+            assert is_delegated_child_process_context() is True
+            child_active.set()
+            assert allow_child_checks.wait(timeout=10)
+            try:
+                model_result = json.loads(
+                    kanban_tools._handle_complete({"summary": "child model tool"})
+                )
+                assert "delegate_task child" in model_result["error"]
+                assert parent_task_status() == "running"
+
+                assert kanban.kanban_command(complete_args("child CLI")) == 1
+                assert parent_task_status() == "running"
+
+                conn = kbc.connect()
+                try:
+                    with pytest.raises(PermissionError, match="delegate_task child"):
+                        kb.complete_task(conn, tid, result="child imported mutator")
+                finally:
+                    conn.close()
+                assert parent_task_status() == "running"
+
+                code = (
+                    "from hermes_cli import kanban_db as kb; "
+                    "from hermes_cli import kanban_db_connect as kbc; "
+                    "conn=kbc.connect(); "
+                    f"kb.complete_task(conn, {tid!r}, result='child subprocess')"
+                )
+                env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+                try:
+                    subprocess_result = env.execute(
+                        _python_with_repo_path(code),
+                        timeout=15,
+                    )
+                finally:
+                    env.cleanup()
+                assert subprocess_result["returncode"] == 1
+                assert "delegate_task child contexts cannot mutate Kanban" in subprocess_result["output"]
+                assert parent_task_status() == "running"
+            finally:
+                child_checks_done.set()
+
+            assert allow_child_finish.wait(timeout=10)
+            return {
+                "final_response": "all child mutation paths refused",
+                "completed": True,
+                "api_calls": 0,
+                "messages": [],
+            }
+
+    child_run = _ChildRun(
+        child=Child(),
+        parent_agent=Parent(),
+        task_index=0,
+        goal="attempt parent mutations",
+        subagent_id=None,
+        child_progress_cb=None,
+    )
+    outcome = {}
+    caller_context = contextvars.copy_context()
+
+    def await_child() -> None:
+        try:
+            outcome["value"] = caller_context.run(child_run.await_child)
+        except BaseException as exc:  # make coordinator-thread failures visible to pytest
+            outcome["exception"] = exc
+
+    coordinator = threading.Thread(target=await_child, daemon=True)
+    coordinator.start()
+    assert child_active.wait(timeout=10)
+
+    # The child is marked and still running in _ChildRun's worker thread, while
+    # the parent retains its independent ContextVar state.
+    assert is_delegated_child_process_context() is False
+    assert parent_task_status() == "running"
+
+    allow_child_checks.set()
+    assert child_checks_done.wait(timeout=20)
+    assert parent_task_status() == "running"
+    allow_child_finish.set()
+    coordinator.join(timeout=10)
+    assert not coordinator.is_alive()
+    assert "exception" not in outcome
+    child_result, error_entry, close_deferred = outcome["value"]
+    assert error_entry is None
+    assert close_deferred is False
+    assert child_result["final_response"] == "all child mutation paths refused"
+
+    assert is_delegated_child_process_context() is False
+    assert parent_supported_complete() == 0
+    assert parent_task_status() == "done"
