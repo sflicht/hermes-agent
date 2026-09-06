@@ -18,6 +18,7 @@ CRON_AUTO_DELIVER_) from the snapshot at both dump sites in
 import os
 import re
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -105,5 +106,32 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
         if os.path.exists(snap):
             with open(snap) as f:
                 assert "HERMES_SESSION_ID" not in f.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.linux_only
+def test_delegated_child_marker_does_not_persist_into_parent_snapshot(tmp_path, monkeypatch):
+    """A shared terminal keeps child lineage for the child process only."""
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        with delegated_child_context():
+            child = env.execute(
+                "printf '<%s>\\n' \"${HERMES_DELEGATED_CHILD_CONTEXT-unset}\""
+            )
+
+        parent = env.execute(
+            "printf '<%s>\\n' \"${HERMES_DELEGATED_CHILD_CONTEXT-unset}\""
+        )
+
+        assert child["returncode"] == 0
+        assert child["output"].strip() == "<1>"
+        assert parent["returncode"] == 0
+        assert parent["output"].strip() == "<unset>"
+        assert "HERMES_DELEGATED_CHILD_CONTEXT" not in Path(env._snapshot_path).read_text()
     finally:
         env.cleanup()

@@ -9,26 +9,16 @@ import re
 import shlex
 from typing import Iterable
 
-# Bridged per-session vars (gateway.session_context._VAR_MAP) are injected fresh onto every
-# command's process env and must NEVER persist in the shared bash snapshot: one long-lived
-# backend serves many sessions, so a snapshot carrying the FIRST session's HERMES_SESSION_ID
-# would make every LATER session source a foreign identity. Every bridged name starts with
-# one of these prefixes (or is HERMES_UI_SESSION_ID); unit tests use this regex as the
-# Python-side contract for the exclusion set.
-# Per-session variables that the gateway bridges freshly onto every command's process environment (via
-# tools/environments/local._inject_session_context_env, reading gateway.session_context._VAR_MAP). They must
-# NEVER be persisted into the shared bash session snapshot: a single long-lived backend serves many
-# concurrent sessions (the messaging gateway, TUI, desktop/web dashboard all collapse the terminal to one
-# "default" environment), so ``export -p`` dumping the FIRST session's HERMES_SESSION_ID into the snapshot
-# makes every LATER session ``source`` that stale value and see a FOREIGN session's identity — overriding
-# the correct per-command Popen env (issue: cross-session HERMES_SESSION_ID leak via the shared snapshot).
-# Stripping them from the snapshot is safe because they are re-injected on every command; a snapshot should
-# only carry the user's own shell state (PATH, functions, exports they set), not Hermes' per-turn session
-# identity. Used by unit tests as the Python-side contract for the exclusion set; the dump path unsets by
-# name/prefix instead of grepping declare lines (see below / issue #71296).
+# Per-command/session variables that Hermes injects freshly into child processes must
+# never persist in the shared bash snapshot. One long-lived backend serves many sessions,
+# so a snapshot carrying the first session's identity would make later sessions source a
+# foreign identity. The gateway-bridged names use these prefixes (or
+# HERMES_UI_SESSION_ID); HERMES_DELEGATED_CHILD_CONTEXT is injected separately for child
+# lineage. Tests use this regex as the Python-side contract for the exclusion set. The
+# dump path unsets by name or prefix instead of grepping declaration lines (issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|"
-    "HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)")
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_DELEGATED_CHILD_CONTEXT|"
+    "HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION|HERMES_BROWSER_CONTROL_)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # mktemp template suffix + the shell variable holding the allocated temp path.
@@ -68,6 +58,7 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     return (
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         "${!HERMES_BROWSER_CONTROL_*} "
+        "HERMES_DELEGATED_CHILD_CONTEXT "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers re-exported
         # by every wrapper with ${VAR:-default} semantics; persisting them would
         # let the FIRST command's value override a later outer-harness value.
