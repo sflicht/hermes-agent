@@ -4,6 +4,7 @@ Jaccard similarity and HRR vector similarity, trust-weighted (ported from KIK me
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -16,7 +17,9 @@ from . import holographic as hrr
 _FACT_COLUMNS = "fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, created_at, updated_at"
 _ROLE_ENTITY, _ROLE_CONTENT = hrr.ROLE_ENTITY, hrr.ROLE_CONTENT
 _PUNCT = ".,;:!?\"'()[]{}#@<>"
-_FTS_OPERATORS = str.maketrans("", "", '"()*^:-+')
+# The words the FTS5 unicode61 tokenizer indexes: runs of letters and digits. Everything else,
+# including "-", "_", "/", "." and the FTS5 operator characters, separates words in the index.
+_FTS_WORD = re.compile(r"[^\W_]+")
 # Stopwords dropped before FTS5 OR-expansion: short English function words that
 # carry no retrieval signal and force false-negative AND matches.
 _FTS_STOPWORDS = frozenset("""
@@ -190,12 +193,19 @@ class FactRetriever:
     @staticmethod
     def _sanitize_fts_query(query: str) -> str:
         """Natural-language query -> FTS5-safe OR expression of quoted tokens. FTS5 AND-joins a multi-word
-        MATCH by default, which tanks recall on prose: drop stopwords and <2-char tokens, strip FTS5 operator
-        chars, phrase-quote each survivor. If nothing survives, return the raw query (zero results, not a SQL error)."""
+        MATCH by default, which tanks recall on prose: drop stopwords and <2-char tokens, then phrase-quote the
+        words each survivor splits into the way the index does ("hermes-bridge" -> "hermes bridge"); deleting
+        the in-word punctuation instead ("hermesbridge") searches for a word the index never holds. Phrases
+        contain only letters and digits, so no FTS5 operator survives. If nothing survives, return the raw
+        query (zero results, not a SQL error)."""
         if not query:
             return ""
-        tokens = [f'"{c}"' for c in (raw.strip(_PUNCT).translate(_FTS_OPERATORS) for raw in query.lower().split())
-                  if len(c) >= 2 and c not in _FTS_STOPWORDS]
+        tokens = []
+        for raw in query.lower().split():
+            token = raw.strip(_PUNCT)
+            words = _FTS_WORD.findall(token)
+            if len(token) >= 2 and token not in _FTS_STOPWORDS and words:
+                tokens.append('"' + " ".join(words) + '"')
         return " OR ".join(tokens) if tokens else query
 
     @staticmethod
